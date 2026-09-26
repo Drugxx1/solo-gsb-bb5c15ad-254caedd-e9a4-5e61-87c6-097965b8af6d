@@ -52,6 +52,13 @@ function describeRecord(r) {
  * 调用方负责筛选记录——例如现场盘点只传入 minute <= 盘点分钟 的记录，
  * 这样晚于盘点时刻的冲突不会影响该时刻的账面持有人。
  *
+ * 性能：同一分钟的待执行记录按交出者分桶（Map<交出者, 记录集>），
+ * 每步归约只按当前持有人 O(1) 定位其可接续记录、O(1) 移除已执行的边，
+ * 不再逐步扫描并复制剩余记录——单件道具同一分钟数千条链式交接时，
+ * 长链处理随记录数近线性增长。歧义仍返回该持有人的全部可接续记录，
+ * 断链仍返回当分钟全部未执行记录，冲突前链与记录顺序保持既有规则
+ * （各集合均按 sortRecords 后的顺序插入，迭代顺序与原 pool 顺序一致）。
+ *
  * @param {Array} records 该道具已筛选并按分钟升序排列的记录
  * @returns {{ok: boolean, holder: string|null, chain: Array, conflict: object|null}}
  */
@@ -63,18 +70,27 @@ function replayPropRecords(records) {
   while (i < records.length) {
     const minute = records[i].minute;
 
-    // 本分钟全部记录，作为尚未使用的有向边集合
-    let pool = [];
+    // 本分钟全部记录，作为尚未使用的有向边集合：
+    // unused 保持分钟池顺序（断链时按原顺序返回全部未执行记录）；
+    // byFrom 按交出者分桶，供每步从当前持有人 O(1) 定位可接续记录
+    const unused = new Set();
+    const byFrom = new Map(); // from -> 该交出者尚未执行的记录集合（保持池顺序）
     while (i < records.length && records[i].minute === minute) {
-      pool.push(records[i]);
+      const r = records[i];
       i += 1;
+      unused.add(r);
+      const bucket = byFrom.get(r.from);
+      if (bucket) bucket.add(r);
+      else byFrom.set(r.from, new Set([r]));
     }
 
     // 同一分钟内从当前持有人沿“唯一出边”反复归约，与录入顺序无关
-    while (pool.length > 0) {
-      const continuable = pool.filter((r) => r.from === holder);
+    while (unused.size > 0) {
+      const bucket = byFrom.get(holder);
+      const continuableCount = bucket ? bucket.size : 0;
 
-      if (continuable.length === 0) {
+      if (continuableCount === 0) {
+        const rest = [...unused]; // 当分钟全部未执行记录，保持池顺序
         return {
           ok: false,
           holder,
@@ -83,17 +99,18 @@ function replayPropRecords(records) {
             type: CONFLICT.BROKEN,
             minute,
             holder,
-            records: pool.map((r) => r.id),
-            recordRefs: pool,
+            records: rest.map((r) => r.id),
+            recordRefs: rest,
             reason:
               `第${minute}分钟道具当前由「${holder}」持有，但该分钟尚未执行的交接记录为` +
-              `${pool.map(describeRecord).join('；')}——交出者均不是「${holder}」，` +
+              `${rest.map(describeRecord).join('；')}——交出者均不是「${holder}」，` +
               `交接链在此断裂，本分钟剩余记录及之后分钟的记录均无法接续。`,
           },
         };
       }
 
-      if (continuable.length > 1) {
+      if (continuableCount > 1) {
+        const continuable = [...bucket]; // 该持有人的全部可接续记录，保持池顺序
         return {
           ok: false,
           holder,
@@ -113,10 +130,11 @@ function replayPropRecords(records) {
         };
       }
 
-      const rec = continuable[0];
+      const rec = bucket.values().next().value;
       chain.push(rec);
       holder = rec.to;
-      pool = pool.filter((r) => r.id !== rec.id); // 该边已使用
+      unused.delete(rec); // 该边已使用（记录 id 唯一，按对象移除与按 id 移除等价）
+      bucket.delete(rec);
     }
   }
 

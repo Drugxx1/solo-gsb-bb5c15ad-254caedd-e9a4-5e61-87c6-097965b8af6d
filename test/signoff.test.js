@@ -243,4 +243,71 @@ test('已核实链：记录被编辑后旧签收失效，链在该记录阻断',
   assert.strictEqual(r.blocker.record.id, 'b');
 });
 
+// 16. 已核实链：同分钟长链全部双方签收 -> VERIFIED，已核实顺序与链接续顺序一致
+test('已核实链：同分钟长链全签贯通，已核实顺序按接续次序', () => {
+  const N = 2000;
+  // 同一分钟 仓库->甲1->...->甲2000->仓库，倒序录入（重放与录入顺序无关）
+  const records = [];
+  for (let k = N - 1; k >= 0; k--) {
+    records.push({
+      id: `r${k}`,
+      propId: 'p0',
+      minute: 4,
+      from: k === 0 ? WAREHOUSE : `甲${k}`,
+      to: k === N - 1 ? WAREHOUSE : `甲${k + 1}`,
+      note: '',
+      createdAt: t(k),
+    });
+  }
+  const data = mkData(['长链'], records);
+  for (const rcd of data.records) signBoth(data, rcd.id);
+  const r = verifiedChain(data, 'p0', 4);
+  assert.strictEqual(r.status, 'VERIFIED');
+  assert.strictEqual(r.verifiedCount, N);
+  assert.strictEqual(r.replayedCount, N);
+  assert.strictEqual(r.lastVerifiedHolder, WAREHOUSE);
+  assert.strictEqual(r.returned, true);
+  // 已核实链顺序即重放接续顺序（与录入顺序无关）
+  assert.strictEqual(r.verifiedChain[0].id, 'r0');
+  assert.strictEqual(r.verifiedChain[N - 1].id, `r${N - 1}`);
+  assert.strictEqual(r.verifiedChain[777].id, 'r777');
+});
+
+// 17. 已核实链：同分钟长链深位缺签 -> 在该记录阻断，其后的记录不计入已核实
+test('已核实链：同分钟长链深位缺签阻断，后续不计入', () => {
+  const N = 2000;
+  const CUT = 1500; // 第 1500 条（甲1500 -> 甲1501）缺 to 侧签收
+  const records = [];
+  for (let k = N - 1; k >= 0; k--) {
+    records.push({
+      id: `r${k}`,
+      propId: 'p0',
+      minute: 4,
+      from: k === 0 ? WAREHOUSE : `甲${k}`,
+      to: k === N - 1 ? WAREHOUSE : `甲${k + 1}`,
+      note: '',
+      createdAt: t(k),
+    });
+  }
+  const data = mkData(['长链缺签'], records);
+  for (const rcd of data.records) {
+    if (rcd.id === `r${CUT}`) {
+      // 只签交出者一侧，接收者侧缺签
+      data.signoffs = applySignoff(data, rcd.id, 'from', rcd.from, recordHash(rcd)).signoffs;
+    } else {
+      signBoth(data, rcd.id);
+    }
+  }
+  const r = verifiedChain(data, 'p0', 4);
+  assert.strictEqual(r.status, 'BLOCKED_SIGNOFF');
+  assert.strictEqual(r.verifiedCount, CUT);
+  assert.strictEqual(r.lastVerifiedHolder, `甲${CUT}`);
+  assert.strictEqual(r.blocker.type, 'MISSING_SIGNOFF');
+  assert.strictEqual(r.blocker.record.id, `r${CUT}`);
+  assert.deepStrictEqual(r.blocker.missingSides, ['to']);
+  // 阻断之后的记录不计入已核实，即使双方都已签收
+  assert.strictEqual(r.verifiedChain.length, CUT);
+  assert.strictEqual(r.verifiedChain[CUT - 1].id, `r${CUT - 1}`);
+});
+
 console.log(`\n全部 ${passed} 个签收 / 已核实链引擎测试通过 ✔`);
