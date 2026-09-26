@@ -169,4 +169,25 @@ test('盘点：未登记名称重名 -> 均列重复录入而非账外', () => {
   assert.strictEqual(result.summary.unregistered, 0);
 });
 
+// 10. 同分钟数千条链式交接：账面持有人取该分钟全部交接完成后的链末端持有人
+test('盘点：同分钟数千条链式交接后账面持有人为链末端持有人', () => {
+  const n = 6000;
+  const records = [];
+  // 同分钟长链：仓库 -> 甲1 -> ... -> 甲(n-1)（未归仓），倒序录入
+  for (let k = n - 1; k >= 0; k -= 1) {
+    records.push(rec('p0', 3, k === 0 ? WAREHOUSE : `甲${k}`, `甲${k + 1}`));
+  }
+  const data = mkData(['链'], records);
+  const result = checkInventory(data, 3, [
+    { name: '链', holder: `甲${n}` }, // 与链末端账面持有人一致
+  ]);
+  const row = one(result, '链');
+  assert.strictEqual(row.status, ROW.MATCH);
+  assert.strictEqual(row.bookHolder, `甲${n}`);
+  // 实物持有人与链末端不一致 -> 持有人不符，账面仍为链末端持有人
+  const mismatch = checkInventory(data, 3, [{ name: '链', holder: WAREHOUSE }]);
+  assert.strictEqual(one(mismatch, '链').status, ROW.MISMATCH);
+  assert.strictEqual(one(mismatch, '链').bookHolder, `甲${n}`);
+});
+
 console.log(`\n全部 ${passed} 个盘点测试通过 ✔`);

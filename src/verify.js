@@ -13,6 +13,12 @@
  *    - 为 0：本分钟仍有未使用记录，却没有一条能从当前持有人交出
  *      => BROKEN（无法接续），定位这些记录，其后分钟的记录同样无法接续。
  * 3. 全部记录重放完毕后持有人仍不是仓库 => NOT_RETURNED（演出结束未归仓）。
+ *
+ * 实现要点：同一分钟的待执行记录先按交出者分组索引（组内保持原有记录顺序），
+ * 之后每步从当前持有人定位可接续记录只需一次查表，不再整池扫描并复制剩余记录；
+ * 每条记录在整个重放中至多被消费一次，因此同一分钟数千条可接续交接的长链
+ * 处理随记录数近线性增长。歧义仍返回该持有人的全部可接续记录，
+ * 断链仍返回当分钟全部未执行记录，冲突前链与记录顺序均与逐条扫描口径一致。
  */
 
 const { WAREHOUSE } = require('./store');
@@ -52,6 +58,10 @@ function describeRecord(r) {
  * 调用方负责筛选记录——例如现场盘点只传入 minute <= 盘点分钟 的记录，
  * 这样晚于盘点时刻的冲突不会影响该时刻的账面持有人。
  *
+ * 同一分钟的待执行记录先按交出者分组索引（组内保持原有记录顺序），
+ * 每步从当前持有人经一次查表定位可接续记录，每条记录至多消费一次，
+ * 长链处理随记录数近线性增长；歧义 / 断链的定位集合与记录顺序保持不变。
+ *
  * @param {Array} records 该道具已筛选并按分钟升序排列的记录
  * @returns {{ok: boolean, holder: string|null, chain: Array, conflict: object|null}}
  */
@@ -64,17 +74,36 @@ function replayPropRecords(records) {
     const minute = records[i].minute;
 
     // 本分钟全部记录，作为尚未使用的有向边集合
-    let pool = [];
+    const pool = [];
     while (i < records.length && records[i].minute === minute) {
       pool.push(records[i]);
       i += 1;
     }
 
-    // 同一分钟内从当前持有人沿“唯一出边”反复归约，与录入顺序无关
-    while (pool.length > 0) {
-      const continuable = pool.filter((r) => r.from === holder);
+    // 同分钟待执行记录按交出者分组（组内保持原有记录顺序）：
+    // 之后每步从当前持有人定位可接续记录只需一次查表，
+    // 不再整池扫描并复制剩余记录；每条记录至多被消费一次
+    const buckets = new Map(); // 交出者 -> { list: 该交出者的记录（按原顺序）, next: 消费游标 }
+    for (const r of pool) {
+      let bucket = buckets.get(r.from);
+      if (!bucket) {
+        bucket = { list: [], next: 0 };
+        buckets.set(r.from, bucket);
+      }
+      bucket.list.push(r);
+    }
+    const used = new Set(); // 已执行的记录（按对象身份标记，供断链时汇总剩余记录）
+    let remaining = pool.length;
 
-      if (continuable.length === 0) {
+    // 同一分钟内从当前持有人沿“唯一出边”反复归约，与录入顺序无关
+    while (remaining > 0) {
+      const bucket = buckets.get(holder);
+      const left = bucket ? bucket.list.length - bucket.next : 0;
+
+      if (left === 0) {
+        // 断链：该分钟仍有未执行记录，却没有一条能从当前持有人交出。
+        // 定位当分钟全部未执行记录（保持原有记录顺序）
+        const rest = pool.filter((r) => !used.has(r));
         return {
           ok: false,
           holder,
@@ -83,17 +112,20 @@ function replayPropRecords(records) {
             type: CONFLICT.BROKEN,
             minute,
             holder,
-            records: pool.map((r) => r.id),
-            recordRefs: pool,
+            records: rest.map((r) => r.id),
+            recordRefs: rest,
             reason:
               `第${minute}分钟道具当前由「${holder}」持有，但该分钟尚未执行的交接记录为` +
-              `${pool.map(describeRecord).join('；')}——交出者均不是「${holder}」，` +
+              `${rest.map(describeRecord).join('；')}——交出者均不是「${holder}」，` +
               `交接链在此断裂，本分钟剩余记录及之后分钟的记录均无法接续。`,
           },
         };
       }
 
-      if (continuable.length > 1) {
+      if (left > 1) {
+        // 歧义：当前持有人同时要交给多个人。
+        // 定位该持有人的全部可接续记录（组内顺序即原有记录顺序）
+        const continuable = bucket.list.slice(bucket.next);
         return {
           ok: false,
           holder,
@@ -113,10 +145,13 @@ function replayPropRecords(records) {
         };
       }
 
-      const rec = continuable[0];
+      // 恰好 1 条可接续：执行交接（该交出者分组的消费游标前进一步）
+      const rec = bucket.list[bucket.next];
       chain.push(rec);
       holder = rec.to;
-      pool = pool.filter((r) => r.id !== rec.id); // 该边已使用
+      bucket.next += 1;
+      used.add(rec);
+      remaining -= 1;
     }
   }
 

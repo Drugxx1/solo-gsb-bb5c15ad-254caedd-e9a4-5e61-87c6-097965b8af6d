@@ -243,4 +243,49 @@ test('已核实链：记录被编辑后旧签收失效，链在该记录阻断',
   assert.strictEqual(r.blocker.record.id, 'b');
 });
 
+// 16. 已核实链：同分钟数千条链式交接全部签收 -> VERIFIED，已核实数等于链长
+test('已核实链：同分钟数千条链式交接全签 -> VERIFIED', () => {
+  const n = 4000;
+  const records = [];
+  // 同分钟长链：仓库 -> 甲1 -> ... -> 甲(n-1) -> 仓库，倒序录入
+  for (let k = n - 1; k >= 0; k -= 1) {
+    records.push(rec('p0', 9, k === 0 ? WAREHOUSE : `甲${k}`, k === n - 1 ? WAREHOUSE : `甲${k + 1}`, `r${k}`));
+  }
+  const data = mkData(['链'], records);
+  for (const r of data.records) signBoth(data, r.id);
+  const out = verifiedChain(data, 'p0', 9);
+  assert.strictEqual(out.status, 'VERIFIED');
+  assert.strictEqual(out.verifiedCount, n);
+  assert.strictEqual(out.totalInWindow, n);
+  assert.strictEqual(out.replayedCount, n);
+  assert.strictEqual(out.lastVerifiedHolder, WAREHOUSE);
+  assert.strictEqual(out.returned, true);
+  assert.strictEqual(out.blocker, null);
+  // 已核实链顺序与唯一链一致：仓库 -> 甲1 -> ... -> 甲(n-1) -> 仓库
+  assert.strictEqual(out.verifiedChain[0].id, 'r0');
+  assert.strictEqual(out.verifiedChain[n - 1].id, `r${n - 1}`);
+});
+
+// 17. 已核实链：长链中段一条缺签 -> 在该记录阻断，此前前缀已核实
+test('已核实链：同分钟长链中段缺签 -> 在该记录精确阻断', () => {
+  const n = 4000;
+  const m = 1999; // 缺签记录在链中的位置（0 起）：r1999 = 甲1999 -> 甲2000
+  const records = [];
+  for (let k = n - 1; k >= 0; k -= 1) {
+    records.push(rec('p0', 9, k === 0 ? WAREHOUSE : `甲${k}`, k === n - 1 ? WAREHOUSE : `甲${k + 1}`, `r${k}`));
+  }
+  const data = mkData(['链'], records);
+  for (const r of data.records) {
+    if (r.id !== `r${m}`) signBoth(data, r.id);
+  }
+  const out = verifiedChain(data, 'p0', 9);
+  assert.strictEqual(out.status, 'BLOCKED_SIGNOFF');
+  assert.strictEqual(out.verifiedCount, m);
+  assert.strictEqual(out.blocker.type, 'MISSING_SIGNOFF');
+  assert.strictEqual(out.blocker.record.id, `r${m}`);
+  assert.deepStrictEqual(out.blocker.missingSides, ['from', 'to']);
+  // 阻断前最后已核实持有人：r(m-1) 的接收者 甲m
+  assert.strictEqual(out.lastVerifiedHolder, `甲${m}`);
+});
+
 console.log(`\n全部 ${passed} 个签收 / 已核实链引擎测试通过 ✔`);
